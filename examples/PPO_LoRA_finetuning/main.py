@@ -500,5 +500,7 @@ def main(config_args):
     with open(f"{saving_path}/history.pkl", "wb") as file:
         pickle.dump(history, file)
 
+    lm_server.close()
+
 if __name__ == '__main__':
     main()
