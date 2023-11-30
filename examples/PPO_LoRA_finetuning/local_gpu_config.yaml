@@ -44,7 +44,7 @@ rl_script_args:
   # rl training
   number_envs: 2
   max_ep_len: 100
-  epochs: 100
+  epochs: 10 # prima era 100
   steps_per_epoch: 10 #256
   save_freq: 1
   output_dir: ???
