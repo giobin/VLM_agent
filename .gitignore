@@ -163,5 +163,10 @@ cython_debug/
 # run outputs
 outputs
 
+# model checkpoints and history files
+**/history.pkl
+**/model.checkpoint
+**/optimizer.checkpoint
+
 # DS_STORE
 .DS_Store
