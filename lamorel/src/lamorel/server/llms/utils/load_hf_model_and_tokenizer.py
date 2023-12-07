@@ -1,10 +1,11 @@
 from enum import Enum
 
-from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer, AutoConfig
+from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer, AutoConfig, IdeficsForVisionText2Text, IdeficsConfig, AutoProcessor
 
 class ModelTypesEnum(Enum):
     causal = AutoModelForCausalLM
     seq2seq = AutoModelForSeq2SeqLM
+    idefics = IdeficsForVisionText2Text
 
 
 def load_hf_model_and_tokenizer(type, path, pretrained):
@@ -26,3 +27,24 @@ def load_hf_model_and_tokenizer(type, path, pretrained):
         model_method = lambda **kwargs: model_class.from_config(config, **kwargs)
 
     return tokenizer, model_method, n_layers
+
+def load_hf_idefics_model_and_processor(type, path, pretrained):
+    print("Loading model {}".format(path))
+
+    # idefics has a processor that encapsulates the tokenizer
+    processor = AutoProcessor.from_pretrained(path)
+    config = AutoConfig.from_pretrained(path, trust_remote_code=True)
+
+    n_layers_key = 'num_hidden_layers'
+    if hasattr(config, "attribute_map") and n_layers_key in config.attribute_map:
+        n_layers_key = config.attribute_map[n_layers_key]
+
+    n_layers = getattr(config, n_layers_key)
+    model_class = ModelTypesEnum[type].value
+    if pretrained:
+        model_method = lambda **kwargs: model_class.from_pretrained(path, **kwargs)
+    else:
+        model_method = lambda **kwargs: model_class.from_config(config, **kwargs)
+    
+    return processor, model_method, n_layers
+

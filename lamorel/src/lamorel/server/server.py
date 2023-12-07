@@ -7,7 +7,7 @@ import numpy as np
 import logging
 lamorel_logger = logging.getLogger('lamorel_logger')
 
-from .llms import HF_LLM
+from .llms import HF_LLM, HF_VLM
 from .llms.updaters import BaseUpdater
 from .llms.module_functions import BaseModuleFunction, LogScoringModuleFn
 from .dispatcher import Dispatcher
@@ -37,7 +37,11 @@ class Server:
             use_cpu = False
             devices = self._compute_current_device_map(config)
             lamorel_logger.info("Devices on process {} (index {}): {}".format(self.accelerator.process_index, self._index, devices))
-        self._model = HF_LLM(config.llm_args, devices, use_cpu)
+        
+        if config.llm_args.model_type == 'idefics':
+            self._model = HF_VLM(config.llm_args, devices, use_cpu)
+        else:
+            self._model = HF_LLM(config.llm_args, devices, use_cpu)
         self._dispatcher = Dispatcher(self._llm_group, self._rl_llm_group_size - 1, self._llm_group_size,
                                       self._is_main_server, self._master_server_rank, self._index)
 
@@ -49,6 +53,8 @@ class Server:
             _fn.llm_config = self._model.get_model_config()
             _fn.initialize()
         self._model.register_module_functions(custom_module_functions)
+
+        lamorel_logger.info(f'the model has {len(custom_module_functions)} custom_module_functions: {custom_module_functions}')
 
         if custom_model_initializer is not None:
             self._model = custom_model_initializer.initialize_model(self._model)

@@ -4,7 +4,7 @@ from math import ceil
 import logging
 lamorel_logger = logging.getLogger('lamorel_logger')
 
-from .utils import load_hf_model_and_tokenizer
+from .utils import load_hf_model_and_tokenizer, load_hf_idefics_model_and_processor
 from .base_llm import BaseLLM
 
 from transformers import BitsAndBytesConfig
@@ -13,6 +13,192 @@ from transformers import BitsAndBytesConfig
 from accelerate import infer_auto_device_map, init_empty_weights
 from contextlib import nullcontext
 
+
+class HF_VLM(BaseLLM):
+    """
+    This class is a wrapper around the language model, and handles distributing
+    and/or compiling the model.
+    For each task the default is text in, text out.
+    """
+    def __init__(self, args, devices, use_cpu):
+        super().__init__(args, devices, use_cpu)
+        print(f"Parallelising HF VLM on {len(self.devices)} devices")
+        # Load model and tokenizer
+        print(f"GIO: {args.model_type=}")
+
+        self._VLM_processor, _model_constructor, num_layers = load_hf_idefics_model_and_processor(
+                args.model_type, args.model_path, args.pretrained
+            )
+        self._VLM_tokenizer = self._VLM_processor.tokenizer
+
+        constructor_kwargs = {
+            "trust_remote_code": True
+        }
+
+        if use_cpu:
+            # Current version of the lib does not support parallelization with cpu
+            self._VLM_model = _model_constructor(**constructor_kwargs).to('cpu')
+        else:
+            # Set model parallelism
+            with init_empty_weights():
+                self._VLM_model = _model_constructor(**constructor_kwargs)
+                self._VLM_model.tie_weights()
+                device_map = infer_auto_device_map(
+                    model=self._VLM_model,
+                    max_memory={
+                        _device: torch.cuda.mem_get_info(f'cuda:{_device}')[0]
+                        for _device in devices
+                    }
+                )
+
+            constructor_kwargs["device_map"] = device_map
+            if args.load_in_4bit:
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    #bnb_4bit_use_double_quant=True,
+                    #bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype="float16"
+                )
+                constructor_kwargs["quantization_config"] = bnb_config
+
+            self._VLM_model = _model_constructor(**constructor_kwargs)
+
+        # Set minibatch generation
+        self.__input_encoder = None
+        self._scoring_minibatch_size = args.minibatch_size
+        if args.model_type == "idefics":
+            #self.__minibatch_generator = self.__build_decoder_minibatch
+            if args.pre_encode_inputs:
+                self.__input_encoder = lambda input: self.__get_past_key_values(input)
+            self.model_type = "idefics"
+        else:
+            raise NotImplementedError()
+
+        if self._VLM_tokenizer.pad_token is not None:
+            self.pad_token = self._VLM_tokenizer(self._VLM_tokenizer.pad_token)
+        else:
+            self.pad_token = 0  # self._LLM_tokenizer(" ")
+        self.__synchronize_gpus_after_scoring = args.parallelism.synchronize_gpus_after_scoring
+        self.__empty_cuda_cache_after_scoring = args.parallelism.empty_cuda_cache_after_scoring
+    
+    def get_model_config(self):
+        return self._VLM_model.config
+
+    def register_module_functions(self, module_functions):
+        self._module_functions = torch.nn.ModuleDict(module_functions)
+        return
+    
+    def get_trainable_module(self):
+        return self._VLM_model
+    
+    def generate(self, contexts, return_logprobs=False, **kwargs):
+        raise NotImplementedError()
+    
+    def _get_idefics_prompts(self, contexts, candidates, minibatch_size):
+        '''
+        create the batch of contexts + actions to score.
+        '''
+        prompts, actions = [],[]
+        for _co,_ca in zip(contexts, candidates):
+            actions.extend([[a] for a in _ca])
+            for _a in _ca:
+                prompts.append([
+                    f"{_co} {_a}"
+                ])
+        assert len(prompts) == len(actions)
+
+        # get action lenghts
+        pad_id = self._VLM_tokenizer.convert_tokens_to_ids(self._VLM_tokenizer.pad_token) # should be 0 for idefics
+        action_tokenized = self._VLM_processor(actions, return_tensors="pt")
+        action_lenghts = (action_tokenized['attention_mask']).sum(dim=-1)  # the number of tokens for each action. 
+
+        # get tokenized prompts
+        prompts_tokenized = self._VLM_processor(prompts, return_tensors="pt")
+        return prompts_tokenized, action_lenghts
+
+    def forward(self, module_function_keys, contexts, candidates=None, require_grad=False, minibatch_size=None,
+                **kwargs):
+        '''
+        module_function_keys = ['score', 'value']
+        contexts = ['Goal of the agent: go to the red ball\nObservation: You see a wall 1 step forward, You see a wall 1 step right\nAction:', '...']
+        candidates=[['turn left', 'turn right', 'go forward', 'pick up', 'drop', 'toggle'],[...]]
+        '''
+        # TODO: crea la lista di prompts totale (mega batch) con le combinazioni context e actions [C1,A1 - C1,A2 - ... - CN,A6]
+        # TODO: for step in range(len(batch_inputs) // _minibatch_size + 1): dividi il mega batch in minibatches
+        # TODO: chiama processor su ogni minibatch. poi model(input)
+        # TODO: concatena tutti i risultati in un result batch
+        # TODO: torna a dividere result batch in modo che ogni entry sia {'score':, 'value':} e che si riferisca a uno specifico context con le 6 actions, cioè che non si michino.
+
+        _forward_results = [[] for _ in range(len(contexts))]
+
+        # create a table which contains the alignment between each context and cand. usefull to build back batches at the end
+        _ids_tables = {i:[] for i in range(len(contexts))}
+        last_cand_count = 0
+        for ix, _cand in enumerate(candidates):
+            _ids_tables[ix].extend(list(range(last_cand_count,last_cand_count + len(_cand))))
+            last_cand_count += len(_cand)
+
+        with torch.no_grad() if not require_grad else nullcontext():
+
+            # get the list of prompts with context + actions combinations
+            prompts_tokenized, action_lenghts = self._get_idefics_prompts(contexts, candidates, minibatch_size)
+
+            # tensorize each minibach and run forward
+            batch_results = {k: [] for k in module_function_keys}
+            _minibatch_size = minibatch_size if minibatch_size is not None else self._scoring_minibatch_size
+            number_overall_samples = prompts_tokenized['input_ids'].shape[0]
+            for step in range(number_overall_samples // _minibatch_size + 1):
+                step_idx = step * _minibatch_size
+                current_minibatch_size = min(_minibatch_size, number_overall_samples - step_idx)
+                lamorel_logger.debug(f"GIO: {step=}, {step_idx=}, {current_minibatch_size=}")
+                if current_minibatch_size <= 0: break
+
+                # cut the prompts batch in minibatches and put them on right device
+                minibatch_inputs = {k:v[step_idx:step_idx + current_minibatch_size].to(self.device) for k,v in prompts_tokenized.items()}
+                minibatch_action_lens = action_lenghts[step_idx:step_idx + current_minibatch_size]
+                minibatch_outputs = self._VLM_model(**minibatch_inputs, output_hidden_states=True)
+
+                lamorel_logger.debug(f"GIO: {minibatch_inputs['input_ids'].shape=}, {minibatch_inputs['attention_mask'].shape=}, {minibatch_inputs['pixel_values'].shape=}, {minibatch_inputs['image_attention_mask'].shape=}")
+                lamorel_logger.debug(f"GIO: {minibatch_outputs['logits'].shape=}")
+                
+                for _key in module_function_keys:
+                    lamorel_logger.debug(f"Computing {_key} function")
+                    _fn = self._module_functions[_key]
+                    results = _fn(forward_outputs=minibatch_outputs,
+                                  minibatch=minibatch_inputs,
+                                  action_lengths=minibatch_action_lens,
+                                  **kwargs)
+                    batch_results[_key].append(results)
+            
+            lamorel_logger.debug(f"GIO: {batch_results=}")
+
+            # concat the results of all the minibatches
+            for k, _ in batch_results.items():
+                if len(batch_results[k]) > 0:
+                    batch_results[k] = torch.cat(batch_results[k])
+
+            for idx in range(len(contexts)):
+                _forward_results[idx] = {}
+                for k, v in batch_results.items():
+                    indices = _ids_tables[idx]
+                    if len(indices) > 0:
+                        _forward_results[idx][k] = v[indices]
+                    else:
+                        _forward_results[idx][k] = torch.tensor([])
+        
+        lamorel_logger.debug(f"GIO: {_forward_results=}")
+
+        if self.__synchronize_gpus_after_scoring:
+            lamorel_logger.debug(f"Synchronizing GPUs on process {self.accelerator.process_index}")
+            for device in self.devices:
+                torch.cuda.synchronize(device)
+        if self.__empty_cuda_cache_after_scoring:
+            lamorel_logger.debug(f"Emptying CUDA cache on process {self.accelerator.process_index}")
+            torch.cuda.empty_cache()
+
+        lamorel_logger.debug(f"Scoring finished on process {self.accelerator.process_index}")
+        return _forward_results
+        
 
 class HF_LLM(BaseLLM):
     """
@@ -113,6 +299,9 @@ class HF_LLM(BaseLLM):
         '''
             Concat state and output
         '''
+
+        # outputs=[{'input_ids': [25, 15344, 1364], 'attention_mask': [1, 1, 1]}, {...}]
+        # inputs=[{'input_ids': [49045, 286, ..., 198, 12502, 0, ..., 0], 'attention_mask': [1, ..., 0, ..., 0]}, {uguale al primo esempio}]
         assert inputs is not None or inputs_representation is not None
         batch = {
             "input_ids": [],
@@ -238,6 +427,17 @@ class HF_LLM(BaseLLM):
 
     def forward(self, module_function_keys, contexts, candidates=None, require_grad=False, minibatch_size=None,
                 **kwargs):
+        '''
+        module_function_keys = ['score', 'value']
+        contexts = ['Goal of the agent: go to the red ball\nObservation: You see a wall 1 step forward, You see a wall 1 step right\nAction:', '...']
+        candidates=[['turn left', 'turn right', 'go forward', 'pick up', 'drop', 'toggle'],[...]]
+        '''
+        # TODO: crea la lista di prompts totale (mega batch) con le combinazioni context e actions [C1,A1 - C1,A2 - ... - CN,A6]
+        # TODO: for step in range(len(batch_inputs) // _minibatch_size + 1): dividi il mega batch in minibatches
+        # TODO: chiama processor su ogni minibatch. poi model(input)
+        # TODO: concatena tutti i risultati in un result batch
+        # TODO: torna a dividere result batch in modo che ogni entry sia {'score':, 'value':} e che si riferisca a uno specifico context con le 6 actions, cioè che non si michino.
+
         _forward_results = [[] for _ in range(len(contexts))]
         if candidates is None:
             candidates = [[""] for _ in range(len(contexts))]
@@ -248,6 +448,13 @@ class HF_LLM(BaseLLM):
             tokenized_contexts = [self._LLM_tokenizer(context, return_token_type_ids=False, add_special_tokens=False)
                                   for context in contexts]
             contexts_max_size = max([len(i['input_ids']) for i in tokenized_contexts])
+
+            lamorel_logger.debug(f" GIO: {self.model_type=}")
+            lamorel_logger.debug(f" GIO: {len(candidates)=}")
+            lamorel_logger.debug(f" GIO: {len(contexts)=}")
+            lamorel_logger.debug(f" GIO: {contexts[0]=}")
+            lamorel_logger.debug(f" GIO: {contexts_max_size=}")
+            lamorel_logger.debug(f" GIO: {tokenized_contexts[0]=}")
 
             # 1) Concat all samples to prepare batches
             for _w, _candidates in enumerate(candidates):
@@ -261,20 +468,26 @@ class HF_LLM(BaseLLM):
                     for output in _candidates]
                 if self.model_type == "causal":
                     cut_input = {_k: _v[:-1] for _k, _v in tokenized_contexts[_w].items()}
+                    lamorel_logger.debug(f" GIO: {cut_input=}")
                     padded_input = self.__pad_sequence(cut_input, contexts_max_size - 1)
                     end_of_input = {_k: [_v[-1]] for _k, _v in tokenized_contexts[_w].items()}
                     outputs = [
                         self.__concat_sequences(end_of_input, _o) for _o in outputs
                     ]
+                    lamorel_logger.debug(f" GIO: {outputs=}")
                 else:
                     padded_input = self.__pad_sequence(tokenized_contexts[_w], contexts_max_size)
 
                 batch_inputs.extend([padded_input for _ in range(len(outputs))])
                 batch_outputs.extend(outputs)
+                lamorel_logger.debug(f" GIO: {len(batch_inputs)=}")
+                lamorel_logger.debug(f" GIO: {len(batch_outputs)=}")
+
                 _w += 1
 
             # 2) If needed, first encode inputs
             _minibatch_size = minibatch_size if minibatch_size is not None else self._scoring_minibatch_size
+            lamorel_logger.debug(f" GIO: {minibatch_size=}, {self._scoring_minibatch_size=}")
             lamorel_logger.debug(
                 f"Preparing to process {len(batch_inputs)} examples with a batch size of {_minibatch_size}...")
             if self.__input_encoder is not None:
@@ -300,9 +513,12 @@ class HF_LLM(BaseLLM):
                     batch_input_representations = torch.cat(batch_input_representations)
                 else:
                     batch_input_representations = None
+            
+            lamorel_logger.debug(f" GIO: {batch_input_representations=}")
 
             # 3) Use decoder + custom modules
             batch_results = {k: [] for k in module_function_keys}
+            lamorel_logger.debug(f" GIO: {batch_results=}")
             for step in range(len(batch_inputs) // _minibatch_size + 1):
                 lamorel_logger.debug(f"Processing minibatch n°{step}...")
                 step_idx = step * _minibatch_size
@@ -328,6 +544,8 @@ class HF_LLM(BaseLLM):
                         minibatch[key] = torch.tensor(value, device=self.device)
 
                 lamorel_logger.debug(f"Calling forward on process {self.accelerator.process_index}")
+                lamorel_logger.debug(f"GIO: {minibatch=}")
+                lamorel_logger.debug(f"GIO: {self._LLM_tokenizer.batch_decode(minibatch['input_ids'])}")
                 _outputs = self._LLM_model(**minibatch)  # Get scores before softmax
                 lamorel_logger.debug(f"Forward succeeded on process {self.accelerator.process_index}")
 
@@ -342,7 +560,10 @@ class HF_LLM(BaseLLM):
                                       tokenized_contexts=batch_inputs[step_idx:step_idx + current_minibatch_size],
                                       **kwargs)
                     batch_results[_key].append(results)
+            
+            lamorel_logger.debug(f"GIO: {batch_results=}")
 
+            # concat the results of all the minibatches
             for k, _ in batch_results.items():
                 if len(batch_results[k]) > 0:
                     batch_results[k] = torch.cat(batch_results[k])
@@ -355,6 +576,8 @@ class HF_LLM(BaseLLM):
                         _forward_results[idx][k] = v[indices]
                     else:
                         _forward_results[idx][k] = torch.tensor([])
+            
+        lamorel_logger.debug(f"GIO: {_forward_results=}")
 
         if self.__synchronize_gpus_after_scoring:
             lamorel_logger.debug(f"Synchronizing GPUs on process {self.accelerator.process_index}")
@@ -365,4 +588,4 @@ class HF_LLM(BaseLLM):
             torch.cuda.empty_cache()
 
         lamorel_logger.debug(f"Scoring finished on process {self.accelerator.process_index}")
-        return _forward_results
+        return _forward_results  # number_envs * {'score', 'value'} where score and values are tensors of shape num_possible_actions (i.e. 6)  ->  [{'score': tensor([-193.6569, ..., -104.9294]), 'value': tensor([[-0.1291], ...,[-0.1291]])}, {'score':..., 'value':...}]
