@@ -94,7 +94,7 @@ class ValueHeadModuleFn_idefics(BaseModuleFunction):
         # Get last layer's hidden from last token in context
         assert self._model_type == "idefics"
 
-        # take the hidden_states of the first action token as <CLS>
+        # take the hidden_states of the last context token as <CLS>
         actions_to_last_context_token_index = -(action_lengths+1)
         action_number = actions_to_last_context_token_index.shape[0]
         row_indexes = torch.arange(action_number)

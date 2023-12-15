@@ -63,6 +63,8 @@ class HF_VLM(BaseLLM):
 
             self._VLM_model = _model_constructor(**constructor_kwargs)
 
+            print(f"prova: {self._VLM_processor.batch_decode(self._VLM_model.generate(**self._VLM_processor([['how are you man?']]).to('cuda:0')))=}")
+
         # Set minibatch generation
         self.__input_encoder = None
         self._scoring_minibatch_size = args.minibatch_size
@@ -75,7 +77,7 @@ class HF_VLM(BaseLLM):
             raise NotImplementedError()
 
         if self._VLM_tokenizer.pad_token is not None:
-            self.pad_token = self._VLM_tokenizer(self._VLM_tokenizer.pad_token)
+            self.pad_token = self._VLM_tokenizer.convert_tokens_to_ids(self._VLM_tokenizer.pad_token)
         else:
             self.pad_token = 0  # self._LLM_tokenizer(" ")
         self.__synchronize_gpus_after_scoring = args.parallelism.synchronize_gpus_after_scoring
@@ -92,7 +94,52 @@ class HF_VLM(BaseLLM):
         return self._VLM_model
     
     def generate(self, contexts, return_logprobs=False, **kwargs):
-        raise NotImplementedError()
+        generations = []
+
+        with torch.no_grad():
+        # batched mode generation does not return the same scores returned when you run the generated sequences via forward.
+        # This is due to padding. Also the generated text spaces at the end of the user/agent sentences are different than the ones added via processor. Anyway scores are close enough.
+            inputs = self._VLM_processor(contexts, add_end_of_utterance_token=False, return_tensors="pt").to(self.device)
+
+            results = self._VLM_model.generate(**inputs, 
+                                                     #eos_token_id=exit_condition, 
+                                                     #bad_words_ids=bad_words_ids, 
+                                                     max_new_tokens=40,
+                                                     return_dict_in_generate=True,
+                                                     output_scores=True,
+                                                     **kwargs)
+            
+            just_generated_idx = results.sequences.shape[1] - inputs['input_ids'].shape[1]
+            generated_sequences = results.sequences[:, -just_generated_idx:]
+            _generated_texts = self._VLM_processor.batch_decode(generated_sequences, skip_special_tokens=False) # padding is on the left, so the last tokens are the generated ones
+
+            mask_for_generated_scores = (generated_sequences == self.pad_token)
+
+            if return_logprobs:
+                logp = torch.stack(results.scores, dim=1)
+                texts_logp = torch.gather(logp, 2, generated_sequences[:, :, None]).squeeze(-1)
+                texts_logp[mask_for_generated_scores] = 0.0
+                _scores = texts_logp.sum(-1)
+            else:
+                probabilities = torch.stack(results.scores, dim=1).softmax(-1)
+                texts_probabilities = torch.gather(probabilities, 2, generated_sequences[:, :, None]).squeeze(-1)
+                _scores = texts_probabilities.prod(-1)
+
+        beam_num = kwargs.get('num_return_sequences', 1) # num_return_sequences >1 means beam generation
+        for idx in range(0,len(_generated_texts), beam_num):
+            generations.append([
+                {
+                    "text": _text,
+                    "score": _score.detach().cpu().numpy()
+                }
+                for _text, _score in zip(_generated_texts[idx : idx + beam_num], _scores[idx : idx + beam_num])
+            ])
+
+            # if "sequences_scores" in results: # Useful for Beam search
+            #     for i in range(len(_generated_texts)):
+            #         generations[-1][i]["beam_score"] = results.sequences_scores[i].detach().cpu().item()
+
+        return generations
     
     def _get_idefics_prompts(self, contexts, candidates, minibatch_size):
         '''
@@ -108,9 +155,9 @@ class HF_VLM(BaseLLM):
         assert len(prompts) == len(actions)
 
         # get action lenghts
-        pad_id = self._VLM_tokenizer.convert_tokens_to_ids(self._VLM_tokenizer.pad_token) # should be 0 for idefics
+        #pad_id = self._VLM_tokenizer.convert_tokens_to_ids(self._VLM_tokenizer.pad_token) # should be 0 for idefics
         action_tokenized = self._VLM_processor(actions, return_tensors="pt")
-        action_lenghts = (action_tokenized['attention_mask']).sum(dim=-1)  # the number of tokens for each action. 
+        action_lenghts = (action_tokenized['attention_mask']).sum(dim=-1) -1 # the number of tokens for each action. -1 is because the tokenization adds <s>
 
         # get tokenized prompts
         prompts_tokenized = self._VLM_processor(prompts, return_tensors="pt")
@@ -123,13 +170,10 @@ class HF_VLM(BaseLLM):
         contexts = ['Goal of the agent: go to the red ball\nObservation: You see a wall 1 step forward, You see a wall 1 step right\nAction:', '...']
         candidates=[['turn left', 'turn right', 'go forward', 'pick up', 'drop', 'toggle'],[...]]
         '''
-        # TODO: crea la lista di prompts totale (mega batch) con le combinazioni context e actions [C1,A1 - C1,A2 - ... - CN,A6]
-        # TODO: for step in range(len(batch_inputs) // _minibatch_size + 1): dividi il mega batch in minibatches
-        # TODO: chiama processor su ogni minibatch. poi model(input)
-        # TODO: concatena tutti i risultati in un result batch
-        # TODO: torna a dividere result batch in modo che ogni entry sia {'score':, 'value':} e che si riferisca a uno specifico context con le 6 actions, cioè che non si michino.
 
         _forward_results = [[] for _ in range(len(contexts))]
+        if candidates is None:
+            candidates = [[""] for _ in range(len(contexts))]
 
         # create a table which contains the alignment between each context and cand. usefull to build back batches at the end
         _ids_tables = {i:[] for i in range(len(contexts))}
@@ -157,9 +201,6 @@ class HF_VLM(BaseLLM):
                 minibatch_inputs = {k:v[step_idx:step_idx + current_minibatch_size].to(self.device) for k,v in prompts_tokenized.items()}
                 minibatch_action_lens = action_lenghts[step_idx:step_idx + current_minibatch_size]
                 minibatch_outputs = self._VLM_model(**minibatch_inputs, output_hidden_states=True)
-
-                lamorel_logger.debug(f"GIO: {minibatch_inputs['input_ids'].shape=}, {minibatch_inputs['attention_mask'].shape=}, {minibatch_inputs['pixel_values'].shape=}, {minibatch_inputs['image_attention_mask'].shape=}")
-                lamorel_logger.debug(f"GIO: {minibatch_outputs['logits'].shape=}")
                 
                 for _key in module_function_keys:
                     lamorel_logger.debug(f"Computing {_key} function")
